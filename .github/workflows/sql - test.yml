@@ -1,16 +1,15 @@
-
 name: SQL Business Logic Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
   test-sql:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     services:
       sqlserver:
@@ -21,6 +20,12 @@ jobs:
           MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         ports:
           - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 15
+          --health-start-period 10s
 
     steps:
       - name: Checkout repository
@@ -28,7 +33,7 @@ jobs:
 
       - name: Install SQL Server tools
         run: |
-          curl -sSL -O https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+          curl -sSL -O https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb
           sudo dpkg -i packages-microsoft-prod.deb
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
@@ -39,34 +44,48 @@ jobs:
         run: |
           for i in {1..30}; do
             if /opt/mssql-tools18/bin/sqlcmd \
-              -S localhost,1433 -U sa -P "$SQL_PASSWORD" \
+              -S localhost,1433 \
+              -U sa \
+              -P "$SQL_PASSWORD" \
               -C -b -Q "SELECT 1"; then
+              echo "SQL Server is ready"
               exit 0
             fi
             sleep 2
           done
 
-          echo "SQL Server failed to start."
+          echo "SQL Server failed to start"
           exit 1
 
-      - name: Run Business Logic script
+      - name: Create database schema and sample data
         env:
           SQL_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         run: |
           /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost,1433 -U sa -P "$SQL_PASSWORD" \
-            -C -b -V 16 \
+            -S localhost,1433 \
+            -U sa \
+            -P "$SQL_PASSWORD" \
+            -C -b \
+            -d master \
+            -i "DBI202 ACADEMIC PROJECT REPORT - GROUP 5 (SE2005).sql"
+
+      - name: Apply business logic
+        env:
+          SQL_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
+        run: |
+          /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost,1433 \
+            -U sa \
+            -P "$SQL_PASSWORD" \
+            -C -b \
+            -d OmnichannelFulfillmentDB \
             -i "DBI202_SE2005_Group5_R5_BusinessLogic.sql"
 
-      - name: Run Business Logic tests
+      - name: Run SQL tests
         env:
           SQL_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         run: |
           /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost,1433 -U sa -P "$SQL_PASSWORD" \
-            -C -b -V 16 \
-            -i "DBI202_SE2005_Group5_R5_Test.sql"
-
-      - name: Report success
-        if: success()
-        run: echo "Business Logic tests completed successfully."
+            -S localhost,1433 \
+            -U sa \
+            -P "$SQL_PASSWORD" \
