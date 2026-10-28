@@ -1,3 +1,4 @@
+
 name: SQL Business Logic Tests
 
 on:
@@ -15,17 +16,19 @@ jobs:
       sqlserver:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
-          ACCEPT_EULA: Y
+          ACCEPT_EULA: "Y"
           MSSQL_PID: Developer
           MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         ports:
           - 1433:1433
         options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd
+          -S localhost -U sa -P '${{ secrets.MSSQL_SA_PASSWORD }}'
+          -C -Q 'SELECT 1' || exit 1"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 15
-          --health-start-period 10s
+          --health-start-period 30s
 
     steps:
       - name: Checkout repository
@@ -44,16 +47,13 @@ jobs:
         run: |
           for i in {1..30}; do
             if /opt/mssql-tools18/bin/sqlcmd \
-              -S localhost,1433 \
-              -U sa \
-              -P "$SQL_PASSWORD" \
-              -C -b -Q "SELECT 1"; then
+              -S localhost,1433 -U sa \
+              -P "$SQL_PASSWORD" -C -b -Q "SELECT 1"; then
               echo "SQL Server is ready"
               exit 0
             fi
             sleep 2
           done
-
           echo "SQL Server failed to start"
           exit 1
 
@@ -62,11 +62,8 @@ jobs:
           SQL_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         run: |
           /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost,1433 \
-            -U sa \
-            -P "$SQL_PASSWORD" \
-            -C -b \
-            -d master \
+            -S localhost,1433 -U sa \
+            -P "$SQL_PASSWORD" -C -b -d master \
             -i "DBI202 ACADEMIC PROJECT REPORT - GROUP 5 (SE2005).sql"
 
       - name: Apply business logic
@@ -74,18 +71,17 @@ jobs:
           SQL_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         run: |
           /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost,1433 \
-            -U sa \
-            -P "$SQL_PASSWORD" \
-            -C -b \
+            -S localhost,1433 -U sa \
+            -P "$SQL_PASSWORD" -C -b \
             -d OmnichannelFulfillmentDB \
             -i "DBI202_SE2005_Group5_R5_BusinessLogic.sql"
 
-      - name: Run SQL tests
+      - name: Run SQL test cases
         env:
           SQL_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         run: |
           /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost,1433 \
-            -U sa \
-            -P "$SQL_PASSWORD" \
+            -S localhost,1433 -U sa \
+            -P "$SQL_PASSWORD" -C -b \
+            -d OmnichannelFulfillmentDB \
+            -i "DBI202_SE2005_Group5_R5_Test.sql"
