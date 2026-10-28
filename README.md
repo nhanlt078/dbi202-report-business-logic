@@ -1,80 +1,47 @@
-## Business Logic
+1. Functions
+Function			Loại				Chức năng
+fn_CalculateChargeableWeight	Scalar			Tính trọng lượng tính cước cần tính cả trọng lượng thể tích
+fn_GetOrderTotal		Scalar			Tính tổng tiền của một đơn hàng.
+fn_GetAvailableStock		Table-valued		Lấy danh sách lô hàng còn tồn khả dụng  phải loại lô hết hạn/hỏng
+fn_GetCustomerTotalPurchases	Scalar			Tính tổng tiền mua hàng của khách, bỏ qua đơn đã hủy.
+fn_GetQuoteTotalCost		Scalar			Tính tổng phí vận chuyển và đóng gói của báo giá phải thống nhất công thức với view.
 
-### Overview
-
-The Business Logic layer implements the core business rules and data operations of the database system. It is implemented using **User-Defined Functions (UDFs), Stored Procedures, and Triggers** in Microsoft SQL Server.
-
-These database objects help ensure data consistency, validate business rules, manage inventory operations, and maintain the integrity of transactions.
-
-### 1. User-Defined Functions (UDFs)
-
-The project includes the following user-defined functions:
-
-| Function | Description |
-|---|---|
-| `fn_CalculateChargeableWeight` | Calculates the chargeable weight by comparing the actual weight with the volumetric weight. |
-| `fn_GetOrderTotal` | Calculates the total value of an order based on the ordered quantities and unit prices in `ORDER_DETAIL`. |
-| `fn_GetAvailableStock` | Retrieves inventory lots that are available, intact, and have a positive available quantity for a specified product and warehouse. |
-
-### 2. Stored Procedures
-
-Stored procedures handle business operations and enforce validation rules.
-
-| Stored Procedure | Description |
-|---|---|
-| `sp_UpsertSalesOrder` | Creates a new sales order or updates an existing order based on the sales channel and external order ID. |
-| `sp_CreateFulfillmentOrder` | Creates a fulfillment order for an unallocated sales order and an active warehouse. |
-| `sp_AllocateInventoryLot` | Allocates inventory from an eligible lot, validates the requested quantity, and updates the available stock. |
-| `sp_SelectShippingQuote` | Selects a shipping quote belonging to the specified package. |
-| `sp_ProcessReturn` | Processes returned products, records their disposition, and updates inventory quantities when products are restocked. |
-
-Transactions are used in the procedures that perform multiple related data modifications to help maintain data consistency when errors occur.
-
-### 3. Database Triggers
-
-Triggers automatically enforce business rules when relevant data is inserted or updated.
-
-| Trigger | Description |
-|---|---|
-| `TRG_BatchAssignment_SameWarehouse` | Ensures fulfillment orders assigned to the same picking batch belong to the same warehouse. |
-| `TRG_ConsolidationAssignment_ValidateGroup` | Validates customer consent and ensures that orders in a consolidation group have consistent warehouse, customer, and delivery address information. |
-| `TRG_PackedAllocation_NotExceedPicked` | Prevents the packed quantity from exceeding the picked quantity for an inventory allocation. |
-| `TRG_LotAllocation_ProtectPickedQuantity` | Prevents an inventory allocation's picked quantity from being reduced below the quantity already packed. |
-
-When a business rule is violated, the corresponding trigger raises an error and rolls back the invalid operation.
-
-### 4. Business Logic Testing
-
-Business logic can be tested using SQL scripts in SQL Server Management Studio (SSMS).
-
-The tests should cover:
-
-- **Valid scenarios:** Confirm that functions return the expected results and stored procedures execute successfully.
-- **Invalid scenarios:** Verify that invalid quantities, unavailable inventory, inactive warehouses, and inconsistent assignments are rejected.
-- **Data integrity:** Check that inventory quantities and related records remain consistent after database operations.
-- **Transaction handling:** Verify that failed operations do not leave partial changes behind.
-
-Example test cases:
-
-| Test Case | Expected Result |
-|---|---|
-| Calculate chargeable weight using valid inputs | Returns the greater of actual and volumetric weight. |
-| Calculate an order's total value | Returns the sum of ordered quantity multiplied by unit price. |
-| Retrieve available inventory | Returns only eligible inventory lots. |
-| Allocate more inventory than is available | Rejects the allocation. |
-| Assign orders from different warehouses to the same picking batch | Rejects the invalid assignment. |
-| Pack more units than have been picked | Rejects the invalid packing quantity. |
-
-### 5. Continuous Integration (CI)
-
-GitHub Actions can be configured to execute SQL business logic tests automatically whenever changes are pushed to the repository or a pull request is created.
-
-A CI workflow should:
-
-1. Set up a SQL Server test environment.
-2. Create the database schema and insert test data.
-3. Deploy the functions, stored procedures, and triggers.
-4. Execute the business logic test scripts.
-5. Report the workflow as successful or failed based on the test results.
-
-**Note:** Automated SQL testing requires a configured SQL Server environment and test scripts that explicitly validate expected results. A successful SQL script execution alone does not guarantee that all business rules are correct.
+2. Stored Procedures
+Stored Procedure		Chức năng chính
+sp_UpsertSalesOrder		Thêm hoặc cập nhật đơn hàng từ kênh bán hàng xử lý cả đơn và chi tiết đơn, nhập lại không trùng.
+sp_CreateFulfillmentOrder	Tạo đơn xử lý tại kho và cập nhật trạng thái đơn gốc.
+sp_AllocateInventoryLot		Phân bổ hàng tồn kho cho đơn hàng, kiểm tra tính hợp lệ và cập nhật tồn kho.
+sp_SelectShippingQuote		Chọn báo giá vận chuyển cho kiện hàng.
+sp_ProcessReturn		    Xử lý hàng trả lại và nhập kho theo phương án đã chọn không cộng tồn hai lần khi gọi lại
+sp_GeneratePickingList		Tạo danh sách lấy hàng và số lượng cần lấy.
+sp_CreatePickingBatch		Tạo đợt lấy hàng và gán đơn hàng vào đợt.
+sp_VerifyFulfillmentOrder	Kiểm tra số lượng phân bổ và xác nhận lấy hàng.
+sp_GeneratePackagingPlan	Đề xuất kế hoạch đóng gói dựa trên trọng lượng và sức chứa bổ sung carton, vật liệu đệm, kích thước, số kiện và bảo vệ hàng dễ vỡ.
+sp_UpdateFulfillmentTracking	Cập nhật trạng thái xử lý đơn hàng và đồng bộ trạng thái đơn gốc.
+sp_GenerateDeliveryManifest	Tạo bảng kê giao hàng cho kho.
+sp_DetectDuplicateOrders	Phát hiện đơn hàng có khả năng trùng lặp để kiểm tra.
+sp_GeneratePackageDocuments	Tạo phiếu đóng gói, nhãn vận chuyển, mã vạch và mã QR.
+sp_UpdateShipmentDeliveryStatus	Cập nhật theo dõi lô hàng và đồng bộ trạng thái khi giao thành công.
+sp_ConsolidateOrders để gộp đơn
+sp_ApprovePackagingPlan để duyệt
+sp_ConfirmPackage để ghi đóng gói thực tế
+sp_GenerateShippingQuotes để tạo/tính lại báo giá
+sp_CreateShipment để tạo shipment và gán kiện.
+3. Triggers
+Trigger	Chức năng kiểm soát
+TRG_BatchAssignment_SameWarehouse		    Đảm bảo các đơn trong cùng đợt lấy hàng thuộc cùng một kho.
+TRG_ConsolidationAssignment_ValidateGroup	Kiểm tra sự đồng ý của khách hàng và tính nhất quán về kho, khách hàng, địa chỉ.
+TRG_PackedAllocation_NotExceedPicked		Không cho đóng gói vượt số lượng đã lấy.
+TRG_LotAllocation_ProtectPickedQuantity		Không cho giảm số lượng đã lấy xuống thấp hơn số lượng đã đóng gói.
+TRG_FulfillmentStatus_ValidateTransition	Ngăn chuyển trạng thái đơn hàng sai quy trình.
+TRG_ShippingQuote_ValidateSelection		    Không cho chọn báo giá hết hạn hoặc dịch vụ vận chuyển không hoạt động.
+ Giữ unique index để mỗi kiện chỉ chọn một báo giá.
+4. Kiểm thử Triggers
+Các trigger được kiểm thử bằng cách cố tình tạo dữ liệu không hợp lệ.
+Trường hợp kiểm thử					Kết quả mong đợi
+Gán đơn từ kho khác vào cùng đợt lấy hàng.		Từ chối và rollback.
+Gộp đơn khi thiếu sự đồng ý hoặc thông tin không khớp.	Từ chối và rollback.
+Đóng gói vượt số lượng đã lấy.				Từ chối và rollback.
+Giảm số lượng đã lấy thấp hơn số lượng đã đóng gói.	Từ chối và rollback.
+Chuyển trạng thái đơn hàng sai quy trình.		Từ chối và rollback.
+Chọn báo giá hết hạn hoặc dịch vụ không hoạt động.	Từ chối và rollback.

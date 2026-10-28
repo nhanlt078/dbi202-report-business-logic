@@ -4,15 +4,15 @@ USE OmnichannelFulfillmentDB;
 GO
 
 IF EXISTS (SELECT 1 FROM CUSTOMER) OR EXISTS (SELECT 1 FROM SALES_ORDER)
-BEGIN
-    PRINT 'The database already contains data. The insert script was skipped.';
-    SET NOEXEC ON;
-END
+    PRINT 'The database already contains data. Sample-data inserts will be skipped; business objects will still be deployed.';
 GO
 
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
 BEGIN TRANSACTION;
+
+IF NOT EXISTS (SELECT 1 FROM CUSTOMER) AND NOT EXISTS (SELECT 1 FROM SALES_ORDER)
+BEGIN
 
 INSERT INTO SALES_CHANNEL (ChannelName, ExternalStoreID, StoreName, ChannelStatus)
 VALUES
@@ -1363,8 +1363,8 @@ VALUES
     (34, 38, 4, 1, 0),
     (34, 38, 67, 2, 0);
 
+END;
 COMMIT TRANSACTION;
-SET NOEXEC OFF;
 GO
 
 SELECT t.name AS TableName, SUM(p.rows) AS [RowCount]
@@ -1397,7 +1397,443 @@ BEGIN
 END;
 GO
 
+/*FN-04: Calculate total purchase value of a customer from non-cancelled orders.*/
+CREATE OR ALTER FUNCTION dbo.fn_GetCustomerTotalPurchases (@CustomerID INT)
+RETURNS DECIMAL(14,2)
+AS
+BEGIN
+    DECLARE @TotalPurchases DECIMAL(14,2);
+    SELECT @TotalPurchases = CAST(COALESCE(SUM(TotalAmount), 0) AS DECIMAL(14,2))
+    FROM SALES_ORDER
+    WHERE CustomerID = @CustomerID
+      AND ExternalStatus <> 'Cancelled'
+      AND InternalStatus <> 'Cancelled';
+    RETURN @TotalPurchases;
+END;
+GO
 
+/* A single canonical formula used by quotation reporting and FN-05. */
+CREATE OR ALTER VIEW dbo.vw_ShippingQuoteTotalCost
+AS
+    SELECT QuoteID,
+           CAST(COALESCE(ShippingFee, 0) + COALESCE(PackagingCost, 0) AS DECIMAL(12,2)) AS TotalCost
+    FROM dbo.SHIPPING_QUOTE;
+GO
+
+/*FN-05: Return total fulfillment cost of one shipping quote.*/
+CREATE OR ALTER FUNCTION dbo.fn_GetQuoteTotalCost (@QuoteID INT)
+RETURNS DECIMAL(12,2)
+AS
+BEGIN
+    DECLARE @TotalCost DECIMAL(12,2);
+    SELECT @TotalCost = COALESCE(TotalCost, 0)
+    FROM dbo.vw_ShippingQuoteTotalCost
+    WHERE QuoteID = @QuoteID;
+    RETURN @TotalCost;
+END;
+GO
+
+/*SP-06: Generate a picking list for all allocations assigned to one batch.*/
+CREATE OR ALTER PROCEDURE dbo.sp_GeneratePickingList
+    @PickingBatchID INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF NOT EXISTS (SELECT 1 FROM PICKING_BATCH WHERE PickingBatchID = @PickingBatchID)
+        THROW 51011, 'The picking batch does not exist.', 1;
+
+    SELECT
+        pb.PickingBatchID,
+        pb.PickingStatus,
+        fo.FulfillmentOrderID,
+        so.OrderID,
+        so.Priority,
+        p.SKU,
+        p.ProductName,
+        il.LotCode,
+        fla.AllocatedQuantity,
+        fla.PickedQuantity,
+        fla.AllocatedQuantity - fla.PickedQuantity AS QuantityToPick
+    FROM PICKING_BATCH pb
+    JOIN BATCH_ASSIGNMENT ba ON ba.PickingBatchID = pb.PickingBatchID
+    JOIN FULFILLMENT_ORDER fo ON fo.FulfillmentOrderID = ba.FulfillmentOrderID
+    JOIN SALES_ORDER so ON so.OrderID = fo.OrderID
+    JOIN FULFILLMENT_LOT_ALLOCATION fla ON fla.FulfillmentOrderID = fo.FulfillmentOrderID
+    JOIN INVENTORY_LOT il ON il.InventoryLotID = fla.InventoryLotID
+    JOIN PRODUCT p ON p.ProductID = il.ProductID
+    WHERE pb.PickingBatchID = @PickingBatchID
+    ORDER BY so.Priority DESC, fo.FulfillmentOrderID, p.ProductName, il.ExpiryDate;
+END;
+GO
+
+/*SP-07: Create a new picking batch and assign its first fulfillment order.*/
+CREATE OR ALTER PROCEDURE dbo.sp_CreatePickingBatch
+    @FulfillmentOrderID INT,
+    @PickingBatchID INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF NOT EXISTS
+        (
+            SELECT 1 FROM FULFILLMENT_ORDER
+            WHERE FulfillmentOrderID = @FulfillmentOrderID
+              AND FulfillmentStatus IN ('Pending', 'Allocated')
+        ) THROW 51012, 'The fulfillment order does not exist or cannot be assigned for picking.', 1;
+        IF EXISTS (SELECT 1 FROM BATCH_ASSIGNMENT WHERE FulfillmentOrderID = @FulfillmentOrderID)
+            THROW 51013, 'The fulfillment order is already assigned to a picking batch.', 1;
+
+        INSERT INTO PICKING_BATCH (PickingStatus, StartedAt, CompletedAt)
+        VALUES ('Assigned', NULL, NULL);
+        SET @PickingBatchID = CONVERT(INT, SCOPE_IDENTITY());
+        INSERT INTO BATCH_ASSIGNMENT (FulfillmentOrderID, PickingBatchID)
+        VALUES (@FulfillmentOrderID, @PickingBatchID);
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/*SP-08: Verify picked quantities before the fulfillment moves to Picking status.*/
+CREATE OR ALTER PROCEDURE dbo.sp_VerifyFulfillmentOrder
+    @FulfillmentOrderID INT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF NOT EXISTS (SELECT 1 FROM FULFILLMENT_ORDER WHERE FulfillmentOrderID = @FulfillmentOrderID)
+            THROW 51014, 'The fulfillment order does not exist.', 1;
+        IF EXISTS
+        (
+            SELECT 1
+            FROM ORDER_DETAIL od
+            JOIN FULFILLMENT_ORDER fo ON fo.OrderID = od.OrderID
+            OUTER APPLY
+            (
+                SELECT COALESCE(SUM(fla.AllocatedQuantity), 0) AS AllocatedQuantity
+                FROM FULFILLMENT_LOT_ALLOCATION fla
+                JOIN INVENTORY_LOT il ON il.InventoryLotID = fla.InventoryLotID
+                WHERE fla.FulfillmentOrderID = @FulfillmentOrderID
+                  AND il.ProductID = od.ProductID
+            ) a
+            WHERE fo.FulfillmentOrderID = @FulfillmentOrderID
+              AND a.AllocatedQuantity <> od.OrderedQuantity
+        ) THROW 51015, 'Allocated quantities do not match the order detail quantities.', 1;
+
+        UPDATE FULFILLMENT_LOT_ALLOCATION
+        SET PickedQuantity = AllocatedQuantity
+        WHERE FulfillmentOrderID = @FulfillmentOrderID;
+        UPDATE FULFILLMENT_ORDER
+        SET FulfillmentStatus = 'Picking'
+        WHERE FulfillmentOrderID = @FulfillmentOrderID;
+        UPDATE so SET InternalStatus = 'Picking'
+        FROM SALES_ORDER so
+        JOIN FULFILLMENT_ORDER fo ON fo.OrderID = so.OrderID
+        WHERE fo.FulfillmentOrderID = @FulfillmentOrderID;
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/*SP-09: Generate a rule-based packaging plan from the group product weight.*/
+CREATE OR ALTER PROCEDURE dbo.sp_GeneratePackagingPlan
+    @ConsolidationGroupID INT,
+    @RuleVersion VARCHAR(20),
+    @PackagingPlanID INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF NOT EXISTS (SELECT 1 FROM CONSOLIDATION_GROUP WHERE ConsolidationGroupID = @ConsolidationGroupID)
+            THROW 51016, 'The consolidation group does not exist.', 1;
+        IF NOT EXISTS (SELECT 1 FROM CONSOLIDATION_ASSIGNMENT WHERE ConsolidationGroupID = @ConsolidationGroupID)
+            THROW 51017, 'The consolidation group has no fulfillment orders.', 1;
+
+        DECLARE @TotalWeight DECIMAL(14,2), @MaxPayload DECIMAL(10,2), @SuggestedPackageCount INT,
+                @MaterialID INT, @LengthCm DECIMAL(10,2), @WidthCm DECIMAL(10,2), @HeightCm DECIMAL(10,2);
+        SELECT @TotalWeight = COALESCE(SUM(od.OrderedQuantity * p.Weight), 0)
+        FROM CONSOLIDATION_ASSIGNMENT ca
+        JOIN FULFILLMENT_ORDER fo ON fo.FulfillmentOrderID = ca.FulfillmentOrderID
+        JOIN ORDER_DETAIL od ON od.OrderID = fo.OrderID
+        JOIN PRODUCT p ON p.ProductID = od.ProductID
+        WHERE ca.ConsolidationGroupID = @ConsolidationGroupID;
+        SELECT TOP (1) @MaterialID = MaterialID, @MaxPayload = MaxPayload,
+            @LengthCm = COALESCE(InnerLengthCm, OuterLengthCm),
+            @WidthCm = COALESCE(InnerWidthCm, OuterWidthCm),
+            @HeightCm = COALESCE(InnerHeightCm, OuterHeightCm)
+        FROM PACKAGING_MATERIAL
+        WHERE MaxPayload IS NOT NULL AND MaxPayload > 0 AND QuantityOnHand > 0
+        ORDER BY MaxPayload DESC, UnitCost;
+        SET @SuggestedPackageCount = CASE
+            WHEN @MaxPayload IS NULL OR @MaxPayload <= 0 THEN 1
+            ELSE CASE WHEN CEILING(@TotalWeight / @MaxPayload) < 1 THEN 1
+                      ELSE CONVERT(INT, CEILING(@TotalWeight / @MaxPayload)) END
+        END;
+
+        INSERT INTO PACKAGING_PLAN (ConsolidationGroupID, RuleVersion, SuggestedPackageCount, PlanStatus)
+        VALUES (@ConsolidationGroupID, @RuleVersion, @SuggestedPackageCount, 'Generated');
+        SET @PackagingPlanID = CONVERT(INT, SCOPE_IDENTITY());
+
+        /* Material, dimensions, package count, and fragile protection are persisted
+           with the proposal so approval can be audited before physical packing. */
+        DECLARE @NewPackages TABLE (PackageID INT PRIMARY KEY);
+        ;WITH Numbers AS
+        (
+            SELECT 1 AS Number
+            UNION ALL SELECT Number + 1 FROM Numbers WHERE Number < @SuggestedPackageCount
+        )
+        INSERT INTO PACKAGE
+            (PackagingPlanID, ShipmentID, EstLengthCm, EstWidthCm, EstHeightCm, EstimatedWeight,
+             PackingSequence, EmptySpaceRatio, FragileProtection, PackageStatus, AbnormalFlag)
+        OUTPUT inserted.PackageID INTO @NewPackages(PackageID)
+        SELECT @PackagingPlanID, NULL, COALESCE(@LengthCm, 1), COALESCE(@WidthCm, 1), COALESCE(@HeightCm, 1),
+               CAST(@TotalWeight / @SuggestedPackageCount AS DECIMAL(10,2)), Number, 0,
+               CASE WHEN EXISTS
+                    (SELECT 1 FROM CONSOLIDATION_ASSIGNMENT ca
+                     JOIN FULFILLMENT_ORDER fo ON fo.FulfillmentOrderID = ca.FulfillmentOrderID
+                     JOIN ORDER_DETAIL od ON od.OrderID = fo.OrderID
+                     JOIN PRODUCT pr ON pr.ProductID = od.ProductID
+                     WHERE ca.ConsolidationGroupID = @ConsolidationGroupID AND pr.FragileFlag = 1)
+                    THEN 1 ELSE 0 END,
+               'Suggested', 0
+        FROM Numbers OPTION (MAXRECURSION 32767);
+
+        IF @MaterialID IS NOT NULL
+            INSERT INTO PACKAGE_MATERIAL_RECOMMENDATION (PackageID, MaterialID, SuggestedQuantity)
+            SELECT PackageID, @MaterialID, 1 FROM @NewPackages;
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/*SP-10: Update fulfillment tracking and synchronize the related sales-order status.*/
+CREATE OR ALTER PROCEDURE dbo.sp_UpdateFulfillmentTracking
+    @FulfillmentOrderID INT,
+    @NewFulfillmentStatus VARCHAR(20)
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF @NewFulfillmentStatus NOT IN ('Pending', 'Allocated', 'Picking', 'Packed', 'Shipped', 'Cancelled')
+            THROW 51018, 'The new fulfillment status is invalid.', 1;
+        IF NOT EXISTS (SELECT 1 FROM FULFILLMENT_ORDER WHERE FulfillmentOrderID = @FulfillmentOrderID)
+            THROW 51019, 'The fulfillment order does not exist.', 1;
+
+        UPDATE FULFILLMENT_ORDER
+        SET FulfillmentStatus = @NewFulfillmentStatus,
+            CompletedAt = CASE WHEN @NewFulfillmentStatus IN ('Shipped', 'Cancelled') THEN SYSDATETIME() ELSE CompletedAt END
+        WHERE FulfillmentOrderID = @FulfillmentOrderID;
+        UPDATE so
+        SET InternalStatus = CASE @NewFulfillmentStatus
+            WHEN 'Picking' THEN 'Picking'
+            WHEN 'Packed' THEN 'Packing'
+            WHEN 'Shipped' THEN 'Shipped'
+            WHEN 'Cancelled' THEN 'Cancelled'
+            ELSE InternalStatus END
+        FROM SALES_ORDER so
+        JOIN FULFILLMENT_ORDER fo ON fo.OrderID = so.OrderID
+        WHERE fo.FulfillmentOrderID = @FulfillmentOrderID;
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/*SP-11: Generate one delivery manifest for an active warehouse and scheduled pickup.*/
+CREATE OR ALTER PROCEDURE dbo.sp_GenerateDeliveryManifest
+    @WarehouseID INT,
+    @PickupScheduledAt DATETIME2,
+    @ManifestID INT OUTPUT,
+    @ManifestCode VARCHAR(50) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF NOT EXISTS (SELECT 1 FROM WAREHOUSE WHERE WarehouseID = @WarehouseID AND WarehouseStatus = 'Active')
+            THROW 51020, 'The warehouse does not exist or is inactive.', 1;
+        IF @PickupScheduledAt < SYSDATETIME()
+            THROW 51021, 'The pickup schedule must be in the future.', 1;
+
+        DECLARE @Sequence INT;
+        SELECT @Sequence = COUNT(*) + 1
+        FROM DELIVERY_MANIFEST WITH (UPDLOCK, HOLDLOCK)
+        WHERE WarehouseID = @WarehouseID
+          AND CONVERT(date, PickupScheduledAt) = CONVERT(date, @PickupScheduledAt);
+        SET @ManifestCode = CONCAT('MF-W', @WarehouseID, '-', CONVERT(char(8), @PickupScheduledAt, 112), '-', RIGHT(CONCAT('000', @Sequence), 3));
+        INSERT INTO DELIVERY_MANIFEST (ManifestCode, WarehouseID, PickupScheduledAt)
+        VALUES (@ManifestCode, @WarehouseID, @PickupScheduledAt);
+        SET @ManifestID = CONVERT(INT, SCOPE_IDENTITY());
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/*TRG-05: Enforce the allowed lifecycle transitions of a fulfillment order.*/
+CREATE OR ALTER TRIGGER dbo.TRG_FulfillmentStatus_ValidateTransition
+ON dbo.FULFILLMENT_ORDER AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF UPDATE(FulfillmentStatus) AND EXISTS
+    (
+        SELECT 1 FROM inserted i
+        JOIN deleted d ON d.FulfillmentOrderID = i.FulfillmentOrderID
+        WHERE i.FulfillmentStatus <> d.FulfillmentStatus
+          AND NOT
+          (
+              (d.FulfillmentStatus = 'Pending'   AND i.FulfillmentStatus IN ('Allocated', 'Cancelled')) OR
+              (d.FulfillmentStatus = 'Allocated' AND i.FulfillmentStatus IN ('Picking', 'Cancelled')) OR
+              (d.FulfillmentStatus = 'Picking'   AND i.FulfillmentStatus IN ('Packed', 'Cancelled')) OR
+              (d.FulfillmentStatus = 'Packed'    AND i.FulfillmentStatus IN ('Shipped', 'Cancelled'))
+          )
+    )
+    BEGIN
+        ROLLBACK TRANSACTION;
+        THROW 51106, 'The requested fulfillment-status transition is not allowed.', 1;
+    END
+END;
+GO
+
+/*TRG-06: A selected quote must use an active service and must not be expired.*/
+CREATE OR ALTER TRIGGER dbo.TRG_ShippingQuote_ValidateSelection
+ON dbo.SHIPPING_QUOTE AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF EXISTS
+    (
+        SELECT 1 FROM inserted i
+        JOIN SHIPPING_SERVICE ss ON ss.ShippingServiceID = i.ShippingServiceID
+        WHERE i.SelectedFlag = 1
+          AND (ss.ServiceStatus <> 'Active' OR (i.ExpiresAt IS NOT NULL AND i.ExpiresAt < SYSDATETIME()))
+    )
+    BEGIN
+        ROLLBACK TRANSACTION;
+        THROW 51107, 'A selected quote must use an active service and must not be expired.', 1;
+    END
+END;
+GO
+
+
+/*SP-12: Detect possible duplicate orders for human review without deleting orders.*/
+CREATE OR ALTER PROCEDURE dbo.sp_DetectDuplicateOrders
+    @MinutesWindow INT = 60
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF @MinutesWindow <= 0
+            THROW 51022, 'The duplicate-detection time window must be positive.', 1;
+
+        INSERT INTO DUPLICATE_ORDER_REVIEW (OrderAID, OrderBID, MatchReason, ReviewStatus)
+        SELECT a.OrderID, b.OrderID,
+            CONCAT('Same customer and delivery address; orders placed ',
+                   ABS(DATEDIFF(MINUTE, a.OrderTime, b.OrderTime)), ' minutes apart.'),
+            'Pending'
+        FROM SALES_ORDER a
+        JOIN SALES_ORDER b ON a.OrderID < b.OrderID
+            AND a.CustomerID = b.CustomerID
+            AND a.DeliveryAddress = b.DeliveryAddress
+            AND ABS(DATEDIFF(MINUTE, a.OrderTime, b.OrderTime)) <= @MinutesWindow
+        WHERE a.InternalStatus <> 'Cancelled' AND b.InternalStatus <> 'Cancelled'
+          AND NOT EXISTS (SELECT 1 FROM DUPLICATE_ORDER_REVIEW d
+                          WHERE d.OrderAID = a.OrderID AND d.OrderBID = b.OrderID);
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/*SP-13: Generate stored references for packing slip, shipping label, barcode and QR code.*/
+CREATE OR ALTER PROCEDURE dbo.sp_GeneratePackageDocuments @PackageID INT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF NOT EXISTS (SELECT 1 FROM PACKAGE WHERE PackageID = @PackageID
+                       AND PackageStatus IN ('Packed', 'Labelled', 'Manifested', 'Shipped'))
+            THROW 51023, 'The package does not exist or has not been packed.', 1;
+
+        UPDATE PACKAGE
+        SET PackingSlipRef = CONCAT('PS-PKG-', @PackageID),
+            ShippingLabelRef = CONCAT('SL-PKG-', @PackageID),
+            BarcodeValue = CONCAT('BC-PKG-', @PackageID),
+            QRCodeValue = CONCAT('QR-PKG-', @PackageID),
+            PackageStatus = CASE WHEN PackageStatus = 'Packed' THEN 'Labelled' ELSE PackageStatus END
+        WHERE PackageID = @PackageID;
+        SELECT PackageID, PackingSlipRef, ShippingLabelRef, BarcodeValue, QRCodeValue, PackageStatus
+        FROM PACKAGE WHERE PackageID = @PackageID;
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/*SP-14: Update shipment tracking and mark linked sales orders delivered when delivery succeeds.*/
+CREATE OR ALTER PROCEDURE dbo.sp_UpdateShipmentDeliveryStatus
+    @ShipmentID INT,
+    @NewShipmentStatus VARCHAR(30)
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF @NewShipmentStatus NOT IN ('ReadyForPickup', 'InTransit', 'Delivered', 'Failed', 'Returned')
+            THROW 51024, 'The new shipment status is invalid.', 1;
+        IF NOT EXISTS (SELECT 1 FROM SHIPMENT WHERE ShipmentID = @ShipmentID)
+            THROW 51025, 'The shipment does not exist.', 1;
+
+        UPDATE SHIPMENT
+        SET ShipmentStatus = @NewShipmentStatus,
+            DeliveredAt = CASE WHEN @NewShipmentStatus = 'Delivered' THEN SYSDATETIME() ELSE DeliveredAt END
+        WHERE ShipmentID = @ShipmentID;
+        IF @NewShipmentStatus = 'Delivered'
+            UPDATE so SET InternalStatus = 'Delivered'
+            FROM SALES_ORDER so
+            JOIN FULFILLMENT_ORDER fo ON fo.OrderID = so.OrderID
+            JOIN CONSOLIDATION_ASSIGNMENT ca ON ca.FulfillmentOrderID = fo.FulfillmentOrderID
+            JOIN PACKAGING_PLAN pp ON pp.ConsolidationGroupID = ca.ConsolidationGroupID
+            JOIN PACKAGE p ON p.PackagingPlanID = pp.PackagingPlanID
+            WHERE p.ShipmentID = @ShipmentID AND so.InternalStatus = 'Shipped';
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
 
 /*FN-02: Calculate the actual total amount of an order based on its line items*/
 CREATE OR ALTER FUNCTION dbo.fn_GetOrderTotal (@OrderID INT)
@@ -1420,6 +1856,7 @@ RETURN
     FROM INVENTORY_LOT
     WHERE ProductID = @ProductID AND WarehouseID = @WarehouseID
       AND InventoryStatus = 'Available' AND ConditionStatus = 'Intact'
+      AND (ExpiryDate IS NULL OR ExpiryDate >= CONVERT(date, SYSDATETIME()))
       AND AvailableQuantity > 0
 );
 GO
@@ -1431,7 +1868,8 @@ CREATE OR ALTER PROCEDURE dbo.sp_UpsertSalesOrder
     @ChannelID INT, @CustomerID INT, @ExternalOrderID VARCHAR(100),
     @ExternalStatus VARCHAR(50), @OrderTime DATETIME2, @Priority INT,
     @DeliveryAddress NVARCHAR(300), @RecipientName NVARCHAR(150),
-    @RecipientPhone VARCHAR(20), @TotalAmount DECIMAL(10,2), @OrderID INT OUTPUT
+    @RecipientPhone VARCHAR(20), @TotalAmount DECIMAL(10,2), @OrderID INT OUTPUT,
+    @OrderDetails NVARCHAR(MAX) = NULL -- JSON array: ProductID, OrderedQuantity, UnitPrice, ExternalProductID
 AS
 BEGIN
     SET NOCOUNT ON; SET XACT_ABORT ON;
@@ -1459,6 +1897,36 @@ BEGIN
                 OrderTime = @OrderTime, Priority = @Priority, DeliveryAddress = @DeliveryAddress,
                 TotalAmount = @TotalAmount, RecipientName = @RecipientName, RecipientPhone = @RecipientPhone
             WHERE OrderID = @OrderID;
+
+        /* Detail rows are optional for a header-only channel update.  When supplied,
+           replace the external line snapshot atomically so retries do not duplicate lines. */
+        IF @OrderDetails IS NOT NULL
+        BEGIN
+            IF ISJSON(@OrderDetails) <> 1
+                THROW 51027, 'OrderDetails must be a valid JSON array.', 1;
+            IF EXISTS
+            (
+                SELECT 1 FROM OPENJSON(@OrderDetails)
+                WITH (ProductID INT '$.ProductID', OrderedQuantity INT '$.OrderedQuantity',
+                      UnitPrice DECIMAL(12,2) '$.UnitPrice', ExternalProductID VARCHAR(100) '$.ExternalProductID') d
+                WHERE d.ProductID IS NULL OR d.OrderedQuantity IS NULL OR d.OrderedQuantity <= 0
+                   OR d.UnitPrice IS NULL OR d.UnitPrice < 0
+                   OR NOT EXISTS (SELECT 1 FROM PRODUCT p WHERE p.ProductID = d.ProductID)
+            ) THROW 51028, 'One or more order-detail rows are invalid.', 1;
+
+            IF EXISTS (SELECT 1 FROM FULFILLMENT_ORDER WHERE OrderID = @OrderID)
+                THROW 51041, 'Order details cannot be replaced after fulfillment has started.', 1;
+
+            DELETE FROM ORDER_DETAIL WHERE OrderID = @OrderID;
+            INSERT INTO ORDER_DETAIL (OrderID, ProductID, OrderedQuantity, UnitPrice, ExternalProductID)
+            SELECT @OrderID, d.ProductID, d.OrderedQuantity, d.UnitPrice, d.ExternalProductID
+            FROM OPENJSON(@OrderDetails)
+            WITH (ProductID INT '$.ProductID', OrderedQuantity INT '$.OrderedQuantity',
+                  UnitPrice DECIMAL(12,2) '$.UnitPrice', ExternalProductID VARCHAR(100) '$.ExternalProductID') d;
+
+            UPDATE SALES_ORDER SET TotalAmount = dbo.fn_GetOrderTotal(@OrderID)
+            WHERE OrderID = @OrderID;
+        END;
         COMMIT TRANSACTION;
     END TRY
     BEGIN CATCH
@@ -1512,8 +1980,29 @@ BEGIN
             JOIN INVENTORY_LOT il WITH (UPDLOCK, HOLDLOCK) ON il.InventoryLotID = @InventoryLotID
             WHERE fo.FulfillmentOrderID = @FulfillmentOrderID AND fo.WarehouseID = il.WarehouseID
               AND od.ProductID = il.ProductID AND il.InventoryStatus = 'Available'
-              AND il.ConditionStatus = 'Intact' AND il.AvailableQuantity >= @Quantity
+              AND il.ConditionStatus = 'Intact'
+              AND (il.ExpiryDate IS NULL OR il.ExpiryDate >= CONVERT(date, SYSDATETIME()))
+              AND il.AvailableQuantity >= @Quantity
         ) THROW 51006, 'Lot is not eligible for this fulfillment or has insufficient stock.', 1;
+
+        /* An order line must never be allocated beyond its ordered quantity. */
+        IF EXISTS
+        (
+            SELECT 1
+            FROM FULFILLMENT_ORDER fo
+            JOIN INVENTORY_LOT il ON il.InventoryLotID = @InventoryLotID
+            JOIN ORDER_DETAIL od ON od.OrderID = fo.OrderID AND od.ProductID = il.ProductID
+            OUTER APPLY
+            (
+                SELECT COALESCE(SUM(fla.AllocatedQuantity), 0) AS AlreadyAllocated
+                FROM FULFILLMENT_LOT_ALLOCATION fla
+                JOIN INVENTORY_LOT allocatedLot ON allocatedLot.InventoryLotID = fla.InventoryLotID
+                WHERE fla.FulfillmentOrderID = fo.FulfillmentOrderID
+                  AND allocatedLot.ProductID = il.ProductID
+            ) a
+            WHERE fo.FulfillmentOrderID = @FulfillmentOrderID
+              AND a.AlreadyAllocated + @Quantity > od.OrderedQuantity
+        ) THROW 51026, 'Allocation quantity exceeds the quantity ordered for this product.', 1;
 
         IF EXISTS (SELECT 1 FROM FULFILLMENT_LOT_ALLOCATION
                    WHERE FulfillmentOrderID = @FulfillmentOrderID AND InventoryLotID = @InventoryLotID)
@@ -1581,17 +2070,30 @@ BEGIN
               AND il.ProductID = @ProductID
         ) THROW 51010, 'The return lot must match the product and receiving warehouse.', 1;
 
+        /* A completed inspection is immutable: repeating the request is a no-op,
+           so a retried integration call cannot credit inventory twice. */
+        IF EXISTS (SELECT 1 FROM RETURN_PRODUCT_SUMMARY
+                   WHERE ReturnRequestID = @ReturnRequestID AND ProductID = @ProductID)
+        BEGIN
+            COMMIT TRANSACTION;
+            RETURN;
+        END;
+
         INSERT INTO RETURN_PRODUCT_SUMMARY
             (ReturnRequestID, ProductID, ReturnQuantity, RestockQuantity, QuarantineQuantity, DisposeQuantity, InspectionSummary)
         VALUES (@ReturnRequestID, @ProductID, @ReturnQuantity, @RestockQuantity,
                 @QuarantineQuantity, @DisposeQuantity, @InspectionSummary);
         IF @RestockQuantity > 0
         BEGIN
-            INSERT INTO RETURN_LOT_CREDIT (ReturnRequestID, InventoryLotID, RestockedQuantity)
-            VALUES (@ReturnRequestID, @InventoryLotID, @RestockQuantity);
-            UPDATE INVENTORY_LOT SET QuantityOnHand = QuantityOnHand + @RestockQuantity,
-                AvailableQuantity = AvailableQuantity + @RestockQuantity
-            WHERE InventoryLotID = @InventoryLotID;
+            IF NOT EXISTS (SELECT 1 FROM RETURN_LOT_CREDIT
+                           WHERE ReturnRequestID = @ReturnRequestID AND InventoryLotID = @InventoryLotID)
+            BEGIN
+                INSERT INTO RETURN_LOT_CREDIT (ReturnRequestID, InventoryLotID, RestockedQuantity)
+                VALUES (@ReturnRequestID, @InventoryLotID, @RestockQuantity);
+                UPDATE INVENTORY_LOT SET QuantityOnHand = QuantityOnHand + @RestockQuantity,
+                    AvailableQuantity = AvailableQuantity + @RestockQuantity
+                WHERE InventoryLotID = @InventoryLotID;
+            END;
         END
         UPDATE RETURN_REQUEST SET ReturnStatus = 'Completed',
             ReceivedAt = COALESCE(ReceivedAt, SYSDATETIME()) WHERE ReturnRequestID = @ReturnRequestID;
@@ -1701,35 +2203,189 @@ BEGIN
 END;
 GO
 
-
-
-
-
-
-
-
-
-BEGIN TRY
-    BEGIN TRANSACTION;
-    DECLARE @ExistingFulfillmentID INT =
-        (SELECT TOP (1) fo.FulfillmentOrderID FROM FULFILLMENT_ORDER fo
-         WHERE NOT EXISTS (SELECT 1 FROM CONSOLIDATION_ASSIGNMENT ca
-                           WHERE ca.FulfillmentOrderID = fo.FulfillmentOrderID)
-         ORDER BY fo.FulfillmentOrderID);
-    DECLARE @TestGroupID INT;
-    INSERT INTO CONSOLIDATION_GROUP (CustomerConsent, GroupStatus, CreatedAt)
-    VALUES (0, 'Forming', SYSDATETIME());
-    SET @TestGroupID = CONVERT(INT, SCOPE_IDENTITY());
-    INSERT INTO CONSOLIDATION_ASSIGNMENT (FulfillmentOrderID, ConsolidationGroupID)
-    VALUES (@ExistingFulfillmentID, @TestGroupID);
-    COMMIT TRANSACTION;
-    THROW 52001, 'Trigger test unexpectedly succeeded.', 1;
-END TRY
-BEGIN CATCH
-    IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
-    IF ERROR_NUMBER() = 51102
-        SELECT ERROR_MESSAGE() AS ExpectedTriggerError;
-    ELSE
-        THROW;
-END CATCH;
+/* One package may have many generated quotes, but exactly one selected quote. */
+IF NOT EXISTS
+(
+    SELECT 1 FROM sys.indexes
+    WHERE object_id = OBJECT_ID(N'dbo.SHIPPING_QUOTE')
+      AND name = N'UX_ShippingQuote_OneSelectedPerPackage'
+)
+    CREATE UNIQUE INDEX UX_ShippingQuote_OneSelectedPerPackage
+        ON dbo.SHIPPING_QUOTE (PackageID)
+        WHERE SelectedFlag = 1;
 GO
+
+/* SP-15: Create (or extend) a consented consolidation group. */
+CREATE OR ALTER PROCEDURE dbo.sp_ConsolidateOrders
+    @FulfillmentOrderID INT,
+    @CustomerConsent BIT,
+    @ConsolidationGroupID INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF @CustomerConsent <> 1
+            THROW 51029, 'Customer consent is required for consolidation.', 1;
+        IF NOT EXISTS (SELECT 1 FROM FULFILLMENT_ORDER
+                       WHERE FulfillmentOrderID = @FulfillmentOrderID
+                         AND FulfillmentStatus IN ('Allocated', 'Picking'))
+            THROW 51030, 'The fulfillment order is not eligible for consolidation.', 1;
+
+        IF @ConsolidationGroupID IS NULL
+        BEGIN
+            INSERT INTO CONSOLIDATION_GROUP (CustomerConsent, GroupStatus, CreatedAt)
+            VALUES (1, 'Open', SYSDATETIME());
+            SET @ConsolidationGroupID = CONVERT(INT, SCOPE_IDENTITY());
+        END
+        ELSE IF NOT EXISTS (SELECT 1 FROM CONSOLIDATION_GROUP
+                            WHERE ConsolidationGroupID = @ConsolidationGroupID
+                              AND CustomerConsent = 1 AND GroupStatus = 'Open')
+            THROW 51031, 'The consolidation group does not exist, lacks consent, or is closed.', 1;
+
+        IF NOT EXISTS (SELECT 1 FROM CONSOLIDATION_ASSIGNMENT
+                       WHERE FulfillmentOrderID = @FulfillmentOrderID)
+            INSERT INTO CONSOLIDATION_ASSIGNMENT (FulfillmentOrderID, ConsolidationGroupID)
+            VALUES (@FulfillmentOrderID, @ConsolidationGroupID);
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/* SP-16: Approve one generated plan only after it has proposed packages. */
+CREATE OR ALTER PROCEDURE dbo.sp_ApprovePackagingPlan @PackagingPlanID INT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF NOT EXISTS (SELECT 1 FROM PACKAGING_PLAN WHERE PackagingPlanID = @PackagingPlanID)
+            THROW 51032, 'The packaging plan does not exist.', 1;
+        IF NOT EXISTS (SELECT 1 FROM PACKAGE WHERE PackagingPlanID = @PackagingPlanID)
+            THROW 51033, 'A packaging plan requires at least one proposed package before approval.', 1;
+        UPDATE PACKAGING_PLAN SET PlanStatus = 'Approved' WHERE PackagingPlanID = @PackagingPlanID;
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/* SP-17: Record actual dimensions and weight after packing a proposed package. */
+CREATE OR ALTER PROCEDURE dbo.sp_ConfirmPackage
+    @PackageID INT, @ActLengthCm DECIMAL(10,2), @ActWidthCm DECIMAL(10,2),
+    @ActHeightCm DECIMAL(10,2), @ActualWeight DECIMAL(10,2), @FragileProtection BIT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF @ActLengthCm <= 0 OR @ActWidthCm <= 0 OR @ActHeightCm <= 0 OR @ActualWeight <= 0
+            THROW 51034, 'Actual package dimensions and weight must be positive.', 1;
+        IF NOT EXISTS
+        (
+            SELECT 1 FROM PACKAGE p JOIN PACKAGING_PLAN pp ON pp.PackagingPlanID = p.PackagingPlanID
+            WHERE p.PackageID = @PackageID AND pp.PlanStatus = 'Approved'
+        ) THROW 51035, 'The package does not exist or its plan has not been approved.', 1;
+        UPDATE PACKAGE
+        SET ActLengthCm = @ActLengthCm, ActWidthCm = @ActWidthCm, ActHeightCm = @ActHeightCm,
+            ActualWeight = @ActualWeight, FragileProtection = @FragileProtection,
+            PackageStatus = 'Packed'
+        WHERE PackageID = @PackageID;
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/* SP-18: Recalculate all active-carrier shipping quotes for one packed package. */
+CREATE OR ALTER PROCEDURE dbo.sp_GenerateShippingQuotes
+    @PackageID INT, @ExpiresAt DATETIME2 = NULL
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        IF NOT EXISTS (SELECT 1 FROM PACKAGE WHERE PackageID = @PackageID)
+            THROW 51036, 'The package does not exist.', 1;
+        IF @ExpiresAt IS NOT NULL AND @ExpiresAt <= SYSDATETIME()
+            THROW 51037, 'Quote expiry must be in the future.', 1;
+
+        DELETE FROM SHIPPING_QUOTE WHERE PackageID = @PackageID AND SelectedFlag = 0;
+        UPDATE SHIPPING_QUOTE SET SelectedFlag = 0 WHERE PackageID = @PackageID;
+        INSERT INTO SHIPPING_QUOTE
+            (PackageID, ShippingServiceID, EstimatedPackageWeight, VolumetricWeight,
+             ShippingFee, PackagingCost, QuotedAt, ExpiresAt, SelectedFlag)
+        SELECT p.PackageID, ss.ShippingServiceID,
+               COALESCE(p.ActualWeight, p.EstimatedWeight),
+               (COALESCE(p.ActLengthCm, p.EstLengthCm) * COALESCE(p.ActWidthCm, p.EstWidthCm) *
+                COALESCE(p.ActHeightCm, p.EstHeightCm)) / NULLIF(ss.VolumetricDivisor, 0),
+               CAST(CASE WHEN ss.BaseFee +
+                    CASE WHEN dbo.fn_CalculateChargeableWeight(COALESCE(p.ActualWeight, p.EstimatedWeight),
+                           COALESCE(p.ActLengthCm, p.EstLengthCm), COALESCE(p.ActWidthCm, p.EstWidthCm),
+                           COALESCE(p.ActHeightCm, p.EstHeightCm), ss.VolumetricDivisor) * ss.RatePerKg < ss.MinimumCharge
+                    THEN ss.MinimumCharge ELSE dbo.fn_CalculateChargeableWeight(COALESCE(p.ActualWeight, p.EstimatedWeight),
+                           COALESCE(p.ActLengthCm, p.EstLengthCm), COALESCE(p.ActWidthCm, p.EstWidthCm),
+                           COALESCE(p.ActHeightCm, p.EstHeightCm), ss.VolumetricDivisor) * ss.RatePerKg END
+                    IS NULL THEN ss.MinimumCharge
+                    ELSE (ss.BaseFee + CASE WHEN dbo.fn_CalculateChargeableWeight(COALESCE(p.ActualWeight, p.EstimatedWeight), COALESCE(p.ActLengthCm, p.EstLengthCm), COALESCE(p.ActWidthCm, p.EstWidthCm), COALESCE(p.ActHeightCm, p.EstHeightCm), ss.VolumetricDivisor) * ss.RatePerKg < ss.MinimumCharge THEN ss.MinimumCharge ELSE dbo.fn_CalculateChargeableWeight(COALESCE(p.ActualWeight, p.EstimatedWeight), COALESCE(p.ActLengthCm, p.EstLengthCm), COALESCE(p.ActWidthCm, p.EstWidthCm), COALESCE(p.ActHeightCm, p.EstHeightCm), ss.VolumetricDivisor) * ss.RatePerKg END) * (1 + ss.FuelSurchargeRate) END AS DECIMAL(12,2)),
+               0, SYSDATETIME(), COALESCE(@ExpiresAt, DATEADD(HOUR, 24, SYSDATETIME())), 0
+        FROM PACKAGE p CROSS JOIN SHIPPING_SERVICE ss
+        WHERE p.PackageID = @PackageID AND ss.ServiceStatus = 'Active';
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+/* SP-19: Create a shipment from the selected quote and attach a package. */
+CREATE OR ALTER PROCEDURE dbo.sp_CreateShipment
+    @PackageID INT, @ManifestID INT = NULL, @ShipmentID INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON; SET XACT_ABORT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        DECLARE @ShippingServiceID INT;
+        SELECT @ShippingServiceID = ShippingServiceID FROM SHIPPING_QUOTE
+        WHERE PackageID = @PackageID AND SelectedFlag = 1;
+        IF @ShippingServiceID IS NULL
+            THROW 51038, 'The package needs a selected shipping quote before shipment creation.', 1;
+        IF @ManifestID IS NOT NULL AND NOT EXISTS (SELECT 1 FROM DELIVERY_MANIFEST WHERE ManifestID = @ManifestID)
+            THROW 51039, 'The delivery manifest does not exist.', 1;
+        IF EXISTS (SELECT 1 FROM PACKAGE WHERE PackageID = @PackageID AND ShipmentID IS NOT NULL)
+            THROW 51040, 'The package is already assigned to a shipment.', 1;
+        INSERT INTO SHIPMENT (ShippingServiceID, ManifestID, TrackingNumber, ShipmentStatus, DeliveredAt)
+        VALUES (@ShippingServiceID, @ManifestID, CONCAT('TRK-', CONVERT(char(8), SYSDATETIME(), 112), '-', @PackageID), 'ReadyForPickup', NULL);
+        SET @ShipmentID = CONVERT(INT, SCOPE_IDENTITY());
+        UPDATE PACKAGE SET ShipmentID = @ShipmentID, PackageStatus = 'Shipped' WHERE PackageID = @PackageID;
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
+
+
+
+
+
+
+
+
+
+
